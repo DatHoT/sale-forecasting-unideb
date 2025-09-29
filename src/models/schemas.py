@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import date
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 # ---- Input primitives ----
 
@@ -31,20 +31,32 @@ class HistoryRow(BaseModel):
 class PredictPairsRequest(BaseModel):
     interval: Interval
     predictor_path: Optional[str] = None
-    # The complete 12w pre-history (and older is fine) for all series you want forecasted
-    history: List[HistoryRow]
+    history: Optional[List[HistoryRow]] = None  # <-- optional
+    export_excel: Optional[bool] = False  # default off
 
 class ForecastByCustomerRequest(BaseModel):
     interval: Interval
     customer_id: str
-    history: List[HistoryRow]
     predictor_path: Optional[str] = None
+    history: Optional[List[HistoryRow]] = None  # <-- optional
 
 class ForecastByGroupRequest(BaseModel):
     interval: Interval
     group_id: str
-    history: List[HistoryRow]
     predictor_path: Optional[str] = None
+    history: Optional[List[HistoryRow]] = None  # <-- optional
+
+class CustomerGroup1Row(BaseModel):
+    customer_id: str
+    item_group1: str
+    week: str
+    y_pred: float
+
+class CustomerGroup2Row(BaseModel):
+    customer_id: str
+    item_group2: str
+    week: str
+    y_pred: float
 
 # ---- Response ----
 
@@ -52,5 +64,12 @@ class JobResponse(BaseModel):
     job_id: str
     rows_pred: int
     series_pred: int
-    outputs: Dict[str, str]  # {"preds_csv": "...", "metrics_xlsx": "..."}
-    overall: Dict[str, float]
+    overall: Dict[str, Optional[float]]
+    predictions: List[dict]  # or your existing PredictionRow model
+
+    metrics_per_individual: List[dict] = []  # keep your concrete type if you had one
+    metrics_by_group: List[dict] = []
+
+    # NEW (optional) aggregated views
+    predictions_by_item_group1: Optional[List[CustomerGroup1Row]] = None
+    predictions_by_item_group2: Optional[List[CustomerGroup2Row]] = None

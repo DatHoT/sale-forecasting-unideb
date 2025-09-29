@@ -1,9 +1,12 @@
 from __future__ import annotations
-import time, warnings
+import time, warnings, math
 from typing import List, Optional
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from autogluon.timeseries import TimeSeriesPredictor, TimeSeriesDataFrame
+from src.core.config import DATASET_PATH, KNOWLEDGE_BASE_MAX_DATE, CONTEXT_WEEKS
 
 # ------------------- CONSTANTS -------------------
 ID_COL, TIME_COL, TARGET_COL = "series_id", "week", "sales"
@@ -17,6 +20,15 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # ------------------- small utils -------------------
+def _read_dataset(path: str) -> pd.DataFrame:
+    if path.endswith(".parquet"):
+        df = pd.read_parquet(path)
+    elif path.endswith(".pkl"):
+        df = pd.read_pickle(path)
+    else:
+        df = pd.read_csv(path)
+    return df
+
 USE_TQDM = False
 def tqdmit(it, total=None, desc=None, unit=None, leave=False):
     return it  # no progress bars
@@ -30,6 +42,21 @@ class phase:
     def __exit__(self, exc_type, exc, tb):
         dt = time.time() - (self.t0 or time.time())
         print(f"[PHASE] {self.name} ✓ {dt:,.2f}s", flush=True)
+
+def _align_monday(ts) -> pd.Timestamp:
+    return pd.to_datetime(ts).to_period("W-MON").start_time
+
+def _clean_num(x):
+    try:
+        x = float(x)
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    except Exception:
+        return None
+
+def _clean_overall(d: dict) -> dict:
+    return {k: _clean_num(v) for k, v in d.items()}
 
 def dedup(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
@@ -74,31 +101,63 @@ def exog_weekly_table(hist: pd.DataFrame) -> pd.DataFrame:
             tbl[ex] = 0.0
     return tbl[[TIME_COL] + EXOG_WEEKLY]
 
-def pad_until_base(hist: pd.DataFrame, bases: pd.DataFrame, exog_tbl: pd.DataFrame) -> pd.DataFrame:
+# ------------- KEY FIX: bounded padding (window_lb..window_ub) -------------
+def pad_until_base(hist: pd.DataFrame, bases: pd.DataFrame, exog_weekly: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pad each series' ACTUAL history weekly-contiguously up to its own base (inclusive).
+    This is equivalent to full-history padding followed by '<= base' cut, but much faster.
+    """
+    # Map series_id -> base timestamp for quick lookup
+    base_map = dict(bases[[ID_COL, "base"]].itertuples(index=False, name=None))
+
     merged = hist.merge(bases[[ID_COL]].drop_duplicates(), on=ID_COL, how="inner")
     parts: List[pd.DataFrame] = []
     n_series = merged[ID_COL].nunique()
-    for sid, g in tqdmit(merged.groupby(ID_COL, sort=False), total=n_series,
-                         desc="Pad contiguous history", unit="series", leave=False):
-        if g.empty: continue
-        tmin, tmax = g[TIME_COL].min(), g[TIME_COL].max()
+
+    for sid, g in tqdmit(merged.groupby(ID_COL, sort=False),
+                         total=n_series, desc="Pad contiguous history (≤ base)", unit="series", leave=False):
+        if g.empty:
+            continue
+        b = base_map.get(sid, None)
+        if b is None:
+            continue
+
+        # Only pad up to base (equivalent to pad full then cut ≤ base)
+        tmin = g[TIME_COL].min()
+        tmax = min(g[TIME_COL].max(), b)
+        if tmin > tmax:
+            continue
+
         rng = pd.date_range(tmin, tmax, freq="W-MON")
         gg = g.set_index(TIME_COL).reindex(rng)
         gg.index.name = TIME_COL
         gg[ID_COL] = sid
+
+        # statics: ffill/bfill; default to UNK if fully missing
         for c in STATIC_COLS:
             if c in g.columns:
-                gg[c] = g[c].ffill().bfill().iloc[0] if gg[c].isna().all() else gg[c].ffill().bfill()
+                gg[c] = g[c].ffill().bfill().iloc[0] if gg[c].isna().all() else g[c].ffill().bfill()
+
         gg[TARGET_COL] = pd.to_numeric(gg[TARGET_COL], errors="coerce").fillna(0.0)
         parts.append(gg.reset_index())
-    panel = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=[ID_COL, TIME_COL, TARGET_COL] + STATIC_COLS)
-    panel = panel.merge(exog_tbl, on=TIME_COL, how="left")
+
+    panel = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+        columns=[ID_COL, TIME_COL, TARGET_COL] + STATIC_COLS
+    )
+
+    # Attach exogs by week; default to 0.0
+    panel = panel.merge(exog_weekly, on=TIME_COL, how="left")
     for ex in EXOG_WEEKLY:
         if ex not in panel.columns:
             panel[ex] = 0.0
-        panel[ex] = pd.to_numeric(panel[ex], errors="coerce").fillna(0.0)
+        else:
+            panel[ex] = pd.to_numeric(panel[ex], errors="coerce").fillna(0.0)
+
     panel = calendarize(panel, TIME_COL)
-    order = [ID_COL, TIME_COL, TARGET_COL] + [c for c in STATIC_COLS if c in panel.columns] + CAL_KNOWN + EXOG_WEEKLY
+    order = [ID_COL, TIME_COL, TARGET_COL] \
+            + [c for c in STATIC_COLS if c in panel.columns] \
+            + CAL_KNOWN + EXOG_WEEKLY
+
     return panel[order].sort_values([ID_COL, TIME_COL]).reset_index(drop=True)
 
 def synthetic_zero_history(bases: pd.DataFrame, min_weeks: int) -> pd.DataFrame:
@@ -112,19 +171,32 @@ def synthetic_zero_history(bases: pd.DataFrame, min_weeks: int) -> pd.DataFrame:
             rows.append((sid, wk, 0.0))
     df = pd.DataFrame(rows, columns=[ID_COL, TIME_COL, TARGET_COL])
     df = calendarize(df, TIME_COL)
-    for c in STATIC_COLS: df[c] = "UNK"
+    for c in STATIC_COLS:
+        df[c] = "UNK"
     return df
 
+# helpers.py
 def choose_per_series_bases(req: pd.DataFrame, Hmodel: int) -> pd.DataFrame:
-    g = req.groupby(ID_COL)[TIME_COL]
-    info = pd.DataFrame({ID_COL: g.count().index, "rmin": g.min().values, "rmax": g.max().values})
+    # ensure weekly-Monday timestamps no matter what the caller passed
+    req[TIME_COL] = to_wmon(req[TIME_COL])
+    df = req.copy()
+    df[TIME_COL] = to_wmon(df[TIME_COL])
+
+    g = df.groupby(ID_COL)[TIME_COL]
+    info = pd.DataFrame({
+        ID_COL: g.count().index,
+        "rmin": g.min().values,
+        "rmax": g.max().values,
+    })
     info["span_h"] = ((info["rmax"] - info["rmin"]).dt.days // 7) + 1
+
     too_wide = info[info["span_h"] > Hmodel]
     if not too_wide.empty:
         raise ValueError(
             "Some series request a span wider than model prediction_length.\n" +
             "\n".join(f" - {row[ID_COL]}: span={row['span_h']} > H={Hmodel}" for _, row in too_wide.iterrows())
         )
+
     info["base"] = info["rmax"] - pd.to_timedelta(Hmodel, unit="W")
     return info[[ID_COL, "base", "rmin", "rmax", "span_h"]]
 
@@ -268,31 +340,117 @@ def metrics_np(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     mape = float(np.mean(np.abs((y_pred[mask] - y_true[mask]) / y_true[mask])) * 100.0) if mask.any() else float("nan")
     return {"MAE": mae, "RMSE": rmse, "MAPE": mape}
 
-def save_artifacts(
-    preds_req: pd.DataFrame,
-    metrics_per_individual: pd.DataFrame,
-    metrics_by_group: pd.DataFrame,
-    metrics_overall: pd.DataFrame,
-    out_dir: pd.Path | str,
-    stem: str,
-) -> dict:
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / f"{stem}_preds_only_requested.csv"
-    xls_path = out_dir / f"{stem}_preds_metrics.xlsx"
+# ------------------- KB helpers -------------------
+def get_context_from_kb(*, customer_id: str | None = None, group_id: str | None = None) -> pd.DataFrame:
+    """Return KB context (features + target) filtered by customer/group if available."""
+    df = _RAW_DF
+    if customer_id and "customer_id" in df.columns:
+        df = df[df["customer_id"].astype(str) == str(customer_id)]
+    if group_id and "group_id" in df.columns:
+        df = df[df["group_id"].astype(str) == str(group_id)]
+    return df.copy()
 
-    preds_req.to_csv(csv_path, index=False)
-    with pd.ExcelWriter(xls_path, engine="xlsxwriter") as writer:
-        preds_req.to_excel(writer, sheet_name="preds_requested", index=False)
-        metrics_per_individual.to_excel(writer, sheet_name="metrics_per_individual", index=False)
-        metrics_by_group.to_excel(writer, sheet_name="metrics_by_group", index=False)
-        metrics_overall.to_excel(writer, sheet_name="metrics_overall", index=False)
-        pd.DataFrame({
-            "note":[
-                "Preds cover ONLY requested (series_id, week).",
-                "Metrics computed only where y_true exists in provided history.",
-                "NOEXOG = calendar-only FUTURE; PAST exog kept to match training inputs.",
-            ]
-        }).to_excel(writer, sheet_name="README", index=False)
+def attach_truth_from_kb(preds: pd.DataFrame) -> pd.DataFrame:
+    """Attach y_true from KB only (safe for evaluation)."""
+    return preds.merge(_TRUTH_DF, on=[ID_COL, TIME_COL], how="left")
 
-    return {"preds_csv": str(csv_path), "metrics_xlsx": str(xls_path)}
+def _overlay_optional_history(kb_df: pd.DataFrame, hist_opt: pd.DataFrame | None) -> pd.DataFrame:
+    """Merge optional user history onto KB: user rows override on (series_id, week)."""
+    if hist_opt is None or hist_opt.empty:
+        return kb_df
+    h = dedup(hist_opt.copy())
+    if ID_COL not in h.columns and {"customer_id","item_id"}.issubset(h.columns):
+        h[ID_COL] = h["customer_id"].astype(str) + "||" + h["item_id"].astype(str)
+    need = {ID_COL, TIME_COL, TARGET_COL}
+    missing = need - set(h.columns)
+    if missing:
+        raise ValueError(f"history missing {missing}")
+    h[ID_COL] = h[ID_COL].astype(str)
+    h[TIME_COL] = to_wmon(h[TIME_COL])
+    h[TARGET_COL] = pd.to_numeric(h[TARGET_COL], errors="coerce").fillna(0.0)
+    for c in STATIC_COLS:
+        if c in h.columns: h[c] = h[c].astype(str).fillna("UNK")
+    for ex in EXOG_WEEKLY:
+        if ex in h.columns: h[ex] = pd.to_numeric(h[ex], errors="coerce")
+    h = calendarize(h, TIME_COL)
+
+    # union columns, prefer user rows (keep="last")
+    cols = list(kb_df.columns.union(h.columns))
+    kb = kb_df.reindex(columns=cols)
+    h2 = h.reindex(columns=cols)
+    merged = pd.concat([kb, h2], ignore_index=True)
+    merged = (merged
+              .sort_values([ID_COL, TIME_COL])
+              .drop_duplicates([ID_COL, TIME_COL], keep="last")
+              .reset_index(drop=True))
+    return merged
+
+def _compute_bases_sliding(series_ids, hist_all, weeks_req, H):
+    """
+    Sliding-window base per series:
+      - If rmax within H weeks after kb_last(series), base = kb_last(series)
+      - Else base = kb_last + H * floor((diff-1)/H)
+      - If series has no kb_last (not in KB): base = rmax - H
+    """
+    rmax = pd.to_datetime(weeks_req.max())
+    sid_df = pd.DataFrame({ID_COL: pd.Index(series_ids, dtype=str)})
+
+    # last known week per series from KB
+    kb_last = (hist_all.groupby(ID_COL, observed=True)[TIME_COL]
+                        .max()
+                        .rename("kb_last")
+                        .reset_index())
+
+    bases = sid_df.merge(kb_last, on=ID_COL, how="left")
+    # default base for unknown series
+    default_base = rmax - pd.to_timedelta(H, unit="W")
+
+    # diff in weeks from kb_last to rmax (NaT -> large)
+    diff_weeks = ((rmax - bases["kb_last"]).dt.days // 7).astype("Int64")
+
+    # start with default everywhere
+    bases["base"] = default_base
+
+    # where kb_last exists:
+    have_hist = bases["kb_last"].notna()
+
+    # within horizon: base = kb_last
+    within = have_hist & (diff_weeks <= H)
+    bases.loc[within, "base"] = bases.loc[within, "kb_last"]
+
+    # beyond horizon: slide in H-chunks: base = kb_last + H * floor((diff-1)/H)
+    beyond = have_hist & (diff_weeks > H)
+    k = ((diff_weeks[beyond] - 1) // H).astype(int)
+    bases.loc[beyond, "base"] = bases.loc[beyond, "kb_last"] + pd.to_timedelta(k * H, unit="W")
+
+    return bases[[ID_COL, "base"]]
+
+# ------------------- Load KB once -------------------
+_RAW_DF = _read_dataset(DATASET_PATH)
+_RAW_DF = dedup(_RAW_DF)
+
+# Normalize columns
+if any((c == TARGET_COL or c.startswith(TARGET_COL)) for c in _RAW_DF.columns):
+    _RAW_DF = ensure_sales(_RAW_DF, TARGET_COL)
+
+if ID_COL not in _RAW_DF.columns and {"partner_id","itemcode"}.issubset(_RAW_DF.columns):
+    _RAW_DF[ID_COL] = _RAW_DF["partner_id"].astype(str) + "||" + _RAW_DF["itemcode"].astype(str)
+
+_RAW_DF[ID_COL] = _RAW_DF[ID_COL].astype(str)
+_RAW_DF[TIME_COL] = to_wmon(_RAW_DF[TIME_COL])
+_RAW_DF[TARGET_COL] = pd.to_numeric(_RAW_DF[TARGET_COL], errors="coerce").fillna(0.0)
+
+for c in STATIC_COLS:
+    if c in _RAW_DF.columns:
+        _RAW_DF[c] = _RAW_DF[c].astype(str).fillna("UNK")
+for ex in EXOG_WEEKLY:
+    if ex in _RAW_DF.columns:
+        _RAW_DF[ex] = pd.to_numeric(_RAW_DF[ex], errors="coerce")
+
+_RAW_DF = calendarize(_RAW_DF, TIME_COL)
+
+_TRUTH_DF = (_RAW_DF[[ID_COL, TIME_COL, TARGET_COL]]
+             .rename(columns={TARGET_COL: "y_true"})
+             .drop_duplicates([ID_COL, TIME_COL]))
+
+

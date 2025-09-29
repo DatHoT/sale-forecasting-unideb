@@ -1,0 +1,12 @@
+output
+outputs
+data
+exports
+models
+catboost_info
+binary_classifier
+.ipynb_checkpoints
+environment.yml
+*.csv
+*.ipynb
+__pycache__
